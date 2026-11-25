@@ -11,10 +11,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Diagnostic transport router that can route UDS messages over `DoIP` or CAN.
+//! Diagnostic transport router that can route UDS messages over `DoIP`, CAN or
+//! K-Line.
 //!
 //! This module provides `DiagnosticTransportRouter` which implements the `EcuGateway`
-//! trait and can route messages to ECUs over multiple transports (`DoIP` and/or CAN).
+//! trait and can route messages to ECUs over multiple transports (`DoIP`, CAN
+//! and/or K-Line).
 //!
 //! # Routing Strategy
 //!
@@ -54,18 +56,115 @@ use cda_interfaces::{
 };
 use tokio::sync::{Mutex, RwLock, mpsc};
 
+/// Uninhabited default for the router's third transport type parameter; a
+/// router left with it never holds a third gateway.
+#[derive(Clone)]
+pub enum DisabledGateway {}
+
+impl PhysicalTransport for DisabledGateway {
+    fn send(
+        &self,
+        _transmission_params: TransmissionParameters,
+        _message: ServicePayload,
+        _response_sender: mpsc::Sender<Result<Option<TransportResponse>, DiagServiceError>>,
+        _expect_uds_reply: bool,
+    ) -> impl Future<Output = Result<tokio::task::JoinHandle<()>, DiagServiceError>> + Send {
+        std::future::ready(Err(DiagServiceError::EcuOffline(
+            "No gateway is configured for this transport".to_owned(),
+        )))
+    }
+
+    fn ecu_online<E: EcuAddresses>(
+        &self,
+        _ecu_name: &str,
+        _ecu_db: &RwLock<E>,
+    ) -> impl Future<Output = Result<(), DiagServiceError>> + Send {
+        std::future::ready(Err(DiagServiceError::EcuOffline(
+            "No gateway is configured for this transport".to_owned(),
+        )))
+    }
+}
+
+impl FunctionalTransport for DisabledGateway {
+    fn send_functional(
+        &self,
+        _transmission_params: TransmissionParameters,
+        _message: ServicePayload,
+        _expected_ecu_logical_addrs: HashMap<u16, String>,
+        _timeout: std::time::Duration,
+        _expect_positive_response: bool,
+    ) -> impl Future<
+        Output = Result<
+            HashMap<String, Result<ServicePayload, DiagServiceError>>,
+            DiagServiceError,
+        >,
+    > + Send {
+        std::future::ready(Err(DiagServiceError::EcuOffline(
+            "No gateway is configured for this transport".to_owned(),
+        )))
+    }
+}
+
+impl NetworkTopology for DisabledGateway {
+    fn get_gateway_network_address(
+        &self,
+        _logical_address: u16,
+    ) -> impl Future<Output = Option<String>> + Send {
+        std::future::ready(None)
+    }
+}
+
+impl TransportProbe for DisabledGateway {
+    fn route_status(&self, _ecu_name: &str) -> impl Future<Output = RouteStatus> + Send {
+        std::future::ready(RouteStatus::NotConfigured)
+    }
+
+    fn probe_ecu(&self, _ecu_name: &str) -> impl Future<Output = bool> + Send {
+        std::future::ready(false)
+    }
+}
+
+#[async_trait]
+impl Shutdown for DisabledGateway {
+    async fn shutdown(&self) {
+        match *self {}
+    }
+}
+
+#[async_trait]
+impl TransportControl for DisabledGateway {
+    async fn enable(&self) -> Result<(), CommControlError> {
+        match *self {}
+    }
+
+    async fn disable(&self) -> Result<(), CommControlError> {
+        match *self {}
+    }
+
+    async fn state(&self) -> TransportState {
+        match *self {}
+    }
+}
+
 /// A router that can route diagnostic messages over multiple transports.
 ///
-/// This router wraps both `DoIP` and CAN gateways. Each ECU is either pinned
+/// This router wraps `DoIP`, CAN and K-Line gateways. Each ECU is either pinned
 /// to a transport via config override or bound to the transport it was first
 /// detected on (`DoIP` preferred); see the module docs for the full strategy.
 #[doc(alias = "MultiTransportGateway")]
-pub struct DiagnosticTransportRouter<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe>
-{
+pub struct DiagnosticTransportRouter<
+    D: EcuGateway + TransportProbe,
+    C: EcuGateway + TransportProbe,
+    // Third transport as a type parameter defaulting to DisabledGateway, so
+    // two-transport callers keep compiling; an ordered gateway list is the
+    // deferred alternative (eclipse-opensovd/opensovd#144).
+    K: EcuGateway + TransportProbe = DisabledGateway,
+> {
     /// Optional `DoIP` gateway
     doip_gateway: Option<D>,
     /// Optional CAN gateway
     can_gateway: Option<C>,
+    kline_gateway: Option<K>,
     /// Per-ECU transport overrides (ECU name lowercase -> transport).
     /// ECUs not in this map are bound at first detection.
     transport_overrides: Arc<HashMap<String, TransportType>>,
@@ -81,8 +180,8 @@ pub struct DiagnosticTransportRouter<D: EcuGateway + TransportProbe, C: EcuGatew
     operation_lock: Arc<Mutex<()>>,
 }
 
-impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe>
-    DiagnosticTransportRouter<D, C>
+impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe, K: EcuGateway + TransportProbe>
+    DiagnosticTransportRouter<D, C, K>
 {
     /// Creates a new diagnostic transport router with the given per-ECU transport overrides.
     #[must_use]
@@ -91,6 +190,7 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe>
         Self {
             doip_gateway: None,
             can_gateway: None,
+            kline_gateway: None,
             transport_overrides: Arc::new(transport_overrides),
             ecu_bindings: Arc::new(RwLock::new(HashMap::default())),
             transport_state: Arc::new(tracker),
@@ -109,6 +209,12 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe>
     #[must_use]
     pub fn with_can(mut self, gateway: C) -> Self {
         self.can_gateway = Some(gateway);
+        self
+    }
+
+    #[must_use]
+    pub fn with_kline(mut self, gateway: K) -> Self {
+        self.kline_gateway = Some(gateway);
         self
     }
 
@@ -141,6 +247,16 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe>
         }
     }
 
+    async fn kline_ecu_network_address(&self, ecu_name: &str) -> Option<String> {
+        match self.kline_gateway {
+            Some(ref kline) => kline
+                .get_ecu_network_address(ecu_name)
+                .await
+                .map(|addr| format!("kline://{addr}")),
+            None => None,
+        }
+    }
+
     /// Returns the network address for an ECU given its bound transport type.
     async fn network_address_for_transport(
         &self,
@@ -153,6 +269,7 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe>
                 None => None,
             },
             TransportType::Can => self.can_ecu_network_address(ecu_name).await,
+            TransportType::KLine => self.kline_ecu_network_address(ecu_name).await,
         }
     }
 
@@ -214,6 +331,14 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe>
             return Ok(transport);
         }
 
+        if let Some(ref kline) = self.kline_gateway
+            && let Some(transport) = self
+                .try_bind_transport(&ecu_name_lower, kline, TransportType::KLine)
+                .await
+        {
+            return Ok(transport);
+        }
+
         Err(DiagServiceError::EcuOffline(ecu_name.to_owned()))
     }
 
@@ -230,8 +355,8 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe>
     }
 }
 
-impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe> PhysicalTransport
-    for DiagnosticTransportRouter<D, C>
+impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe, K: EcuGateway + TransportProbe>
+    PhysicalTransport for DiagnosticTransportRouter<D, C, K>
 {
     #[tracing::instrument(skip_all, fields(
         ecu = %transmission_params.ecu_name,
@@ -273,6 +398,19 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe> PhysicalTra
                 )
                 .await
             }
+            TransportType::KLine => {
+                let kline = self.kline_gateway.as_ref().ok_or_else(|| {
+                    DiagServiceError::EcuOffline(transmission_params.ecu_name.clone())
+                })?;
+                kline
+                    .send(
+                        transmission_params,
+                        message,
+                        response_sender,
+                        expect_uds_reply,
+                    )
+                    .await
+            }
         }
     }
 
@@ -295,12 +433,16 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe> PhysicalTra
                 Some(ref can) => can.ecu_online(ecu_name, ecu_db).await,
                 None => Err(DiagServiceError::EcuOffline(ecu_name.to_owned())),
             },
+            TransportType::KLine => match self.kline_gateway {
+                Some(ref kline) => kline.ecu_online(ecu_name, ecu_db).await,
+                None => Err(DiagServiceError::EcuOffline(ecu_name.to_owned())),
+            },
         }
     }
 }
 
-impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe> FunctionalTransport
-    for DiagnosticTransportRouter<D, C>
+impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe, K: EcuGateway + TransportProbe>
+    FunctionalTransport for DiagnosticTransportRouter<D, C, K>
 {
     async fn send_functional(
         &self,
@@ -323,9 +465,10 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe> FunctionalT
                 .await;
         }
 
-        if self.can_gateway.is_some() {
+        if self.can_gateway.is_some() || self.kline_gateway.is_some() {
             Err(DiagServiceError::RequestNotSupported(
-                "CAN transport does not support functional communication".to_owned(),
+                "Neither the CAN nor the K-Line transport supports functional communication"
+                    .to_owned(),
             ))
         } else {
             Err(DiagServiceError::EcuOffline(
@@ -335,8 +478,8 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe> FunctionalT
     }
 }
 
-impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe> NetworkTopology
-    for DiagnosticTransportRouter<D, C>
+impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe, K: EcuGateway + TransportProbe>
+    NetworkTopology for DiagnosticTransportRouter<D, C, K>
 {
     async fn get_gateway_network_address(&self, logical_address: u16) -> Option<String> {
         // DoIP addresses are returned verbatim (bare IP) to keep the SOVD
@@ -351,6 +494,12 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe> NetworkTopo
             && let Some(addr) = can.get_gateway_network_address(logical_address).await
         {
             return Some(format!("can://{addr}"));
+        }
+
+        if let Some(ref kline) = self.kline_gateway
+            && let Some(addr) = kline.get_gateway_network_address(logical_address).await
+        {
+            return Some(format!("kline://{addr}"));
         }
 
         None
@@ -374,19 +523,22 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe> NetworkTopo
             return self.network_address_for_transport(&ecu_name, bound).await;
         }
 
-        // No binding yet - try DoIP first, then CAN
+        // No binding yet - try DoIP first, then CAN, then K-Line
         if let Some(ref doip) = self.doip_gateway
             && let Some(addr) = doip.get_ecu_network_address(&ecu_name).await
         {
             return Some(addr);
         }
-        self.can_ecu_network_address(&ecu_name).await
+        if let Some(addr) = self.can_ecu_network_address(&ecu_name).await {
+            return Some(addr);
+        }
+        self.kline_ecu_network_address(&ecu_name).await
     }
 }
 
 #[async_trait]
-impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe> Shutdown
-    for DiagnosticTransportRouter<D, C>
+impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe, K: EcuGateway + TransportProbe>
+    Shutdown for DiagnosticTransportRouter<D, C, K>
 {
     async fn shutdown(&self) {
         if let Some(ref doip) = self.doip_gateway {
@@ -395,16 +547,20 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe> Shutdown
         if let Some(ref can) = self.can_gateway {
             can.shutdown().await;
         }
+        if let Some(ref kline) = self.kline_gateway {
+            kline.shutdown().await;
+        }
     }
 }
 
-impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe> Clone
-    for DiagnosticTransportRouter<D, C>
+impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe, K: EcuGateway + TransportProbe>
+    Clone for DiagnosticTransportRouter<D, C, K>
 {
     fn clone(&self) -> Self {
         Self {
             doip_gateway: self.doip_gateway.clone(),
             can_gateway: self.can_gateway.clone(),
+            kline_gateway: self.kline_gateway.clone(),
             transport_overrides: Arc::clone(&self.transport_overrides),
             ecu_bindings: Arc::clone(&self.ecu_bindings),
             transport_state: Arc::clone(&self.transport_state),
@@ -416,7 +572,8 @@ impl<D: EcuGateway + TransportProbe, C: EcuGateway + TransportProbe> Clone
 impl<
     D: EcuGateway + FunctionalTransport + TransportProbe + TransportControl,
     C: EcuGateway + TransportProbe + TransportControl,
-> DiagnosticTransportRouter<D, C>
+    K: EcuGateway + TransportProbe + TransportControl,
+> DiagnosticTransportRouter<D, C, K>
 {
     /// Shared body for [`TransportControl::enable`] and [`TransportControl::disable`].
     ///
@@ -447,6 +604,7 @@ impl<
         let mut errors = Vec::new();
         let mut doip_succeeded = false;
         let mut can_succeeded = false;
+        let mut kline_succeeded = false;
         if let Some(doip) = &self.doip_gateway {
             let gateway = doip as &dyn TransportControl;
             if let Err(e) = gateway_op(gateway).await {
@@ -461,6 +619,14 @@ impl<
                 errors.push(e.to_string());
             } else {
                 can_succeeded = true;
+            }
+        }
+        if let Some(kline) = &self.kline_gateway {
+            let gateway = kline as &dyn TransportControl;
+            if let Err(e) = gateway_op(gateway).await {
+                errors.push(e.to_string());
+            } else {
+                kline_succeeded = true;
             }
         }
 
@@ -485,6 +651,13 @@ impl<
                     tracing::error!(error = %error, "Failed to roll back partially enabled CAN gateway");
                     can.shutdown().await;
                 }
+                if kline_succeeded
+                    && let Some(kline) = &self.kline_gateway
+                    && let Err(error) = kline.disable().await
+                {
+                    tracing::error!(error = %error, "Failed to roll back partially enabled K-Line gateway");
+                    kline.shutdown().await;
+                }
             }
             self.transport_state
                 .transition(TransportState::Failed)
@@ -505,7 +678,8 @@ impl<
 impl<
     D: EcuGateway + FunctionalTransport + TransportProbe + TransportControl,
     C: EcuGateway + TransportProbe + TransportControl,
-> TransportControl for DiagnosticTransportRouter<D, C>
+    K: EcuGateway + TransportProbe + TransportControl,
+> TransportControl for DiagnosticTransportRouter<D, C, K>
 {
     async fn enable(&self) -> Result<(), CommControlError> {
         self.run_lifecycle_operation(
@@ -541,10 +715,19 @@ impl<
         ecu_name: &str,
         endpoint: DoipEndpoint,
     ) -> Result<(), DiagServiceError> {
-        if self.transport_overrides.get(&ecu_name.to_lowercase()) == Some(&TransportType::Can) {
-            return Err(DiagServiceError::RequestNotSupported(format!(
-                "ECU {ecu_name} is configured for CAN, direct DoIP connection is not possible"
-            )));
+        match self.transport_overrides.get(&ecu_name.to_lowercase()) {
+            Some(&TransportType::Can) => {
+                return Err(DiagServiceError::RequestNotSupported(format!(
+                    "ECU {ecu_name} is configured for CAN, direct DoIP connection is not possible"
+                )));
+            }
+            Some(&TransportType::KLine) => {
+                return Err(DiagServiceError::RequestNotSupported(format!(
+                    "ECU {ecu_name} is configured for K-Line, direct DoIP connection is not \
+                     possible"
+                )));
+            }
+            Some(&TransportType::DoIP) | None => {}
         }
         let Some(ref doip) = self.doip_gateway else {
             return Err(DiagServiceError::RequestNotSupported(
@@ -572,6 +755,7 @@ mod tests {
     fn test_transport_type_debug() {
         assert_eq!(format!("{:?}", TransportType::DoIP), "DoIP");
         assert_eq!(format!("{:?}", TransportType::Can), "Can");
+        assert_eq!(format!("{:?}", TransportType::KLine), "KLine");
     }
 
     /// A gateway with configurable outcomes and observable call counts, so a
@@ -717,7 +901,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_connect_is_delegated_to_the_doip_gateway() {
-        let router = DiagnosticTransportRouter::new(HashMap::default())
+        let router = DiagnosticTransportRouter::<FakeGateway, FakeGateway>::new(HashMap::default())
             .with_doip(FakeGateway::new(false))
             .with_can(FakeGateway::new(false));
 
@@ -740,10 +924,23 @@ mod tests {
 
     #[tokio::test]
     async fn direct_connect_is_unsupported_for_can_pinned_ecus() {
-        let router = DiagnosticTransportRouter::new(HashMap::from_iter([(
-            "ecu_a".to_owned(),
-            TransportType::Can,
-        )]))
+        let router = DiagnosticTransportRouter::<FakeGateway, FakeGateway>::new(
+            HashMap::from_iter([("ecu_a".to_owned(), TransportType::Can)]),
+        )
+        .with_doip(FakeGateway::new(false))
+        .with_can(FakeGateway::new(false));
+
+        assert!(matches!(
+            router.connect_ecu_direct("ECU_A", test_endpoint()).await,
+            Err(DiagServiceError::RequestNotSupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_connect_is_unsupported_for_kline_pinned_ecus() {
+        let router = DiagnosticTransportRouter::<FakeGateway, FakeGateway>::new(
+            HashMap::from_iter([("ecu_a".to_owned(), TransportType::KLine)]),
+        )
         .with_doip(FakeGateway::new(false))
         .with_can(FakeGateway::new(false));
 
@@ -759,7 +956,7 @@ mod tests {
     /// re-detecting it.
     #[tokio::test]
     async fn disable_clears_transport_bindings_so_the_next_cycle_re_detects() {
-        let router = DiagnosticTransportRouter::new(HashMap::default())
+        let router = DiagnosticTransportRouter::<FakeGateway, FakeGateway>::new(HashMap::default())
             .with_doip(FakeGateway::new(false))
             .with_can(FakeGateway::new(false));
         router.enable().await.unwrap();
@@ -785,7 +982,7 @@ mod tests {
     async fn failed_enable_rolls_back_the_gateway_that_already_succeeded() {
         let doip = FakeGateway::new(false);
         let can = FakeGateway::new(true);
-        let router = DiagnosticTransportRouter::new(HashMap::default())
+        let router = DiagnosticTransportRouter::<FakeGateway, FakeGateway>::new(HashMap::default())
             .with_doip(doip.clone())
             .with_can(can.clone());
 
@@ -825,7 +1022,7 @@ mod tests {
     async fn failed_rollback_falls_back_to_the_gateway_shutdown_path() {
         let doip = FakeGateway::new(false).with_failing_disable();
         let can = FakeGateway::new(true);
-        let router = DiagnosticTransportRouter::new(HashMap::default())
+        let router = DiagnosticTransportRouter::<FakeGateway, FakeGateway>::new(HashMap::default())
             .with_doip(doip.clone())
             .with_can(can.clone());
 
@@ -856,7 +1053,7 @@ mod tests {
     async fn successful_enable_rolls_back_nothing() {
         let doip = FakeGateway::new(false);
         let can = FakeGateway::new(false);
-        let router = DiagnosticTransportRouter::new(HashMap::default())
+        let router = DiagnosticTransportRouter::<FakeGateway, FakeGateway>::new(HashMap::default())
             .with_doip(doip.clone())
             .with_can(can.clone());
 
