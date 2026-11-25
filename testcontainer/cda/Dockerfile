@@ -79,6 +79,7 @@ COPY cda-core/Cargo.toml ./cda-core/Cargo.toml
 COPY cda-comm-doip/Cargo.toml ./cda-comm-doip/Cargo.toml
 COPY cda-comm-uds/Cargo.toml ./cda-comm-uds/Cargo.toml
 COPY cda-comm-can/Cargo.toml ./cda-comm-can/Cargo.toml
+COPY cda-comm-kline/Cargo.toml ./cda-comm-kline/Cargo.toml
 COPY cda-transport-router/Cargo.toml ./cda-transport-router/Cargo.toml
 COPY cda-database/Cargo.toml ./cda-database/Cargo.toml
 COPY cda-plugin-lock-priority/Cargo.toml ./cda-plugin-lock-priority/Cargo.toml
@@ -154,6 +155,7 @@ COPY cda-core ./cda-core
 COPY cda-comm-doip ./cda-comm-doip
 COPY cda-comm-uds ./cda-comm-uds
 COPY cda-comm-can ./cda-comm-can
+COPY cda-comm-kline ./cda-comm-kline
 COPY cda-transport-router ./cda-transport-router
 COPY cda-database ./cda-database
 COPY cda-plugin-lock-priority ./cda-plugin-lock-priority
