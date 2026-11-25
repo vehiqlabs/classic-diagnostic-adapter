@@ -18,3 +18,4 @@ Communication
    01_doip_communication
    02_can_communication
    03_uds_communication
+   04_kline_communication
