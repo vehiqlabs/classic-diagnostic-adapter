@@ -2823,6 +2823,7 @@ dependencies = [
  "backon",
  "cda-comm-can",
  "cda-comm-doip",
+ "cda-comm-kline",
  "cda-comm-uds",
  "cda-core",
  "cda-database",

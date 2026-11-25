@@ -180,7 +180,11 @@ pub async fn load_databases<S: SecurityPlugin>(
         )
         .collect();
 
-    mark_duplicate_ecus_by_address(&databases).await;
+    mark_duplicate_ecus_by_address(
+        &databases,
+        config.kline.as_ref().map(|kline| kline.interface.as_str()),
+    )
+    .await;
 
     let file_managers: FileManagerMap = file_managers_map
         .into_iter()
@@ -317,38 +321,57 @@ enum DuplicateTargetKey {
     /// CAN arbitration ID pair from the MDD com-params, for ECUs without
     /// resolved `DoIP` addressing (e.g. CAN-only databases).
     Can(cda_interfaces::CanIds),
+    /// K-Line interface and target address byte from the MDD com-params, for
+    /// ECUs with neither resolved `DoIP` addressing nor CAN IDs.
+    KLine { interface: String, target: u8 },
+}
+
+fn duplicate_target_key(
+    doip: Option<(u16, u16)>,
+    can_ids: Option<cda_interfaces::CanIds>,
+    kline: Option<(&str, u8)>,
+) -> Option<DuplicateTargetKey> {
+    match (doip, can_ids, kline) {
+        (Some((gateway, logical)), _, _) => Some(DuplicateTargetKey::Doip { gateway, logical }),
+        (None, Some(ids), _) => Some(DuplicateTargetKey::Can(ids)),
+        (None, None, Some((interface, target))) => Some(DuplicateTargetKey::KLine {
+            interface: interface.to_owned(),
+            target,
+        }),
+        (None, None, None) => None,
+    }
 }
 
 /// Scans `databases` for ECUs sharing the same transport target - the
 /// resolved `DoIP` gateway/logical address pair, or (for ECUs without `DoIP`
-/// addressing) the CAN arbitration ID pair from the MDD com-params - and
-/// marks them as duplicates of each other by calling
+/// addressing) the CAN arbitration ID pair from the MDD com-params, or (for
+/// ECUs without either, when K-Line is configured) the K-Line interface and
+/// MDD target address - and marks them as duplicates of each other by calling
 /// `set_duplicating_ecu_names` on each affected manager.
 async fn mark_duplicate_ecus_by_address<S: SecurityPlugin>(
     databases: &HashMap<String, RwLock<EcuManager<S>>>,
+    kline_interface: Option<&str>,
 ) {
-    use cda_interfaces::CanComParamProvider as _;
+    use cda_interfaces::{CanComParamProvider as _, KLineComParamProvider as _};
 
     let mut ecus_by_target: HashMap<DuplicateTargetKey, Vec<String>> = HashMap::new();
     for (name, db_lock) in databases {
         let db = db_lock.read().await;
-        let key = if db.doip_addresses_resolved() {
-            DuplicateTargetKey::Doip {
-                gateway: db.logical_gateway_address(),
-                logical: db.logical_address(),
-            }
-        } else if let Some(ids) = db.can_ids() {
-            DuplicateTargetKey::Can(ids)
-        } else {
+        let doip = db
+            .doip_addresses_resolved()
+            .then(|| (db.logical_gateway_address(), db.logical_address()));
+        let kline = kline_interface.zip(db.kline_physical_address());
+        let Some(key) = duplicate_target_key(doip, db.can_ids(), kline) else {
             // Without resolved DoIP addressing the addresses are com-param
             // fallback values shared by every such ECU (e.g. a functional
-            // description), and without CAN IDs there is no other target
-            // identity - no evidence of an actual collision, so grouping
-            // would spuriously mark unrelated ECUs as duplicates and
-            // suppress base-variant fallback for all of them.
+            // description), and without CAN IDs or a K-Line target there is
+            // no other target identity - no evidence of an actual collision,
+            // so grouping would spuriously mark unrelated ECUs as duplicates
+            // and suppress base-variant fallback for all of them.
             tracing::debug!(
                 ecu_name = %name,
-                "Skipping duplicate detection - neither resolved DoIP addressing nor CAN IDs"
+                "Skipping duplicate detection - neither resolved DoIP addressing, CAN IDs nor \
+                 a K-Line target"
             );
             continue;
         };
@@ -627,6 +650,167 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn can_ids() -> cda_interfaces::CanIds {
+        cda_interfaces::CanIds::try_from_raw(0x7E0, 0x7E8).expect("valid test CAN IDs")
+    }
+
+    #[test]
+    fn duplicate_target_key_prefers_doip_then_can_then_kline() {
+        assert!(matches!(
+            duplicate_target_key(
+                Some((0x1000, 0x2000)),
+                Some(can_ids()),
+                Some(("COM3", 0x10))
+            ),
+            Some(DuplicateTargetKey::Doip {
+                gateway: 0x1000,
+                logical: 0x2000
+            })
+        ));
+        assert!(matches!(
+            duplicate_target_key(None, Some(can_ids()), Some(("COM3", 0x10))),
+            Some(DuplicateTargetKey::Can(_))
+        ));
+        assert!(matches!(
+            duplicate_target_key(None, None, Some(("COM3", 0x10))),
+            Some(DuplicateTargetKey::KLine { target: 0x10, .. })
+        ));
+        assert!(duplicate_target_key(None, None, None).is_none());
+    }
+
+    fn kline_ecu(
+        ecu_name: &'static str,
+        target: &str,
+    ) -> EcuManager<cda_plugin_security::DefaultSecurityPluginData> {
+        use cda_database::datatypes::database_builder::{
+            DiagLayerParams, EcuDataBuilder, EcuDataParams,
+        };
+
+        let protocol_name = Protocol::default().to_string();
+        let mut builder = EcuDataBuilder::new();
+        let protocol = builder.create_protocol(&protocol_name, None, None, None);
+        let com_param = builder.create_com_param("CP_PhysReqTargetAddr");
+        let value = builder.create_simple_value(target);
+        let cp_refs = vec![
+            builder.create_com_param_ref(None, None, None, Some(protocol), None),
+            builder.create_com_param_ref(Some(value), None, Some(com_param), Some(protocol), None),
+        ];
+        let diag_layer = builder.create_diag_layer(DiagLayerParams {
+            short_name: ecu_name,
+            com_param_refs: Some(cp_refs),
+            ..Default::default()
+        });
+        let variant = builder.create_variant(diag_layer, true, None, None);
+        let db = builder.finish(EcuDataParams {
+            ecu_name,
+            revision: "1",
+            version: "1.0.0",
+            variants: Some(vec![variant]),
+            ..Default::default()
+        });
+        EcuManager::new(
+            db,
+            Protocol::default(),
+            &cda_interfaces::datatypes::ComParams::default(),
+            cda_interfaces::datatypes::DatabaseNamingConvention::default(),
+            EcuManagerConfig {
+                type_: cda_interfaces::EcuManagerType::Ecu,
+                fallback_to_base_variant: true,
+                strict_parameter_validation: false,
+            },
+            &cda_interfaces::FunctionalDescriptionConfig {
+                description_database: "functional_groups".to_owned(),
+                enabled_functional_groups: None,
+                protocol_position:
+                    cda_interfaces::datatypes::DiagnosticServiceAffixPosition::Suffix,
+            },
+        )
+        .expect("EcuManager from the test database")
+    }
+
+    fn kline_databases()
+    -> HashMap<String, RwLock<EcuManager<cda_plugin_security::DefaultSecurityPluginData>>> {
+        [
+            ("radio_a", kline_ecu("RadioA", "0x10")),
+            ("radio_b", kline_ecu("RadioB", "0x10")),
+            ("engine", kline_ecu("Engine", "0x11")),
+        ]
+        .into_iter()
+        .map(|(name, ecu)| (name.to_owned(), RwLock::new(ecu)))
+        .collect()
+    }
+
+    async fn duplicates_of(
+        databases: &HashMap<
+            String,
+            RwLock<EcuManager<cda_plugin_security::DefaultSecurityPluginData>>,
+        >,
+        ecu_name: &str,
+    ) -> Option<HashSet<String>> {
+        use cda_interfaces::EcuManager as _;
+
+        databases
+            .get(ecu_name)
+            .expect("test ECU")
+            .read()
+            .await
+            .duplicating_ecu_names()
+            .cloned()
+    }
+
+    #[tokio::test]
+    async fn ecus_sharing_the_kline_target_are_marked_as_duplicates() {
+        let databases = kline_databases();
+
+        mark_duplicate_ecus_by_address(&databases, Some("/dev/ttyUSB0")).await;
+
+        assert_eq!(
+            duplicates_of(&databases, "radio_a").await,
+            Some(HashSet::from_iter(["radio_b".to_owned()]))
+        );
+        assert_eq!(
+            duplicates_of(&databases, "radio_b").await,
+            Some(HashSet::from_iter(["radio_a".to_owned()]))
+        );
+        assert_eq!(duplicates_of(&databases, "engine").await, None);
+    }
+
+    #[tokio::test]
+    async fn loading_with_a_kline_section_compares_kline_targets() {
+        let config = crate::config::configfile::Configuration {
+            kline: Some(
+                toml::from_str(r#"interface = "/dev/ttyUSB0""#).expect("valid K-Line config"),
+            ),
+            ..crate::config::configfile::Configuration::default()
+        };
+
+        let (databases, file_managers) =
+            load_databases::<cda_plugin_security::DefaultSecurityPluginData>(&config, &[], None)
+                .await
+                .expect("loading no MDD files succeeds");
+
+        assert!(databases.is_empty());
+        assert!(file_managers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn kline_targets_are_not_compared_without_a_kline_interface() {
+        let databases = kline_databases();
+
+        mark_duplicate_ecus_by_address(&databases, None).await;
+
+        assert_eq!(duplicates_of(&databases, "radio_a").await, None);
+        assert_eq!(duplicates_of(&databases, "radio_b").await, None);
+    }
+
+    #[test]
+    fn kline_targets_are_duplicates_only_on_the_same_interface_and_address() {
+        let key = |interface, target| duplicate_target_key(None, None, Some((interface, target)));
+        assert!(key("/dev/ttyUSB0", 0x10) == key("/dev/ttyUSB0", 0x10));
+        assert!(key("/dev/ttyUSB0", 0x10) != key("/dev/ttyUSB0", 0x11));
+        assert!(key("/dev/ttyUSB0", 0x10) != key("COM3", 0x10));
+    }
 
     #[tokio::test]
     async fn resolve_mdd_paths_ignores_non_mdd_files() {

@@ -60,7 +60,7 @@ check:
 	cargo +$(STABLE) check --workspace
 
 test:
-	cargo +$(STABLE) test --locked --workspace --features opensovd-cda/doip-direct-connect,cda-comm-kline/kline $(ARGS)
+	cargo +$(STABLE) test --locked --workspace --features opensovd-cda/doip-direct-connect,opensovd-cda/kline $(ARGS)
 
 integration-test:
 	cargo +$(STABLE) test --locked -p integration-tests --features integration-tests $(ARGS)
@@ -85,6 +85,7 @@ build-minimal-cda:
 
 bazel-build:
 	bazel build $(BAZEL_BUILD_CONFIG) //:cda_mbedtls //:opensovd-cda
+	bazel build $(BAZEL_BUILD_CONFIG) --config=kline //:opensovd-cda
 ifneq ($(BAZEL_CAN_BUILD_CONFIG),)
 	bazel build $(BAZEL_BUILD_CONFIG) $(BAZEL_CAN_BUILD_CONFIG) //:opensovd-cda
 endif
@@ -131,7 +132,7 @@ precommit-all-features:
 	uv run --locked --group tools prek run --all-files --group CI --group @ungrouped --show-diff-on-failure
 
 coverage:
-	cargo +$(STABLE) llvm-cov --workspace --features opensovd-cda/doip-direct-connect,cda-comm-kline/kline --lcov --output-path lcov.info -- --show-output
+	cargo +$(STABLE) llvm-cov --workspace --features opensovd-cda/doip-direct-connect,opensovd-cda/kline --lcov --output-path lcov.info -- --show-output
 
 coverage-can:
 	cargo +$(STABLE) llvm-cov -p opensovd-cda -p cda-comm-can --features opensovd-cda/can-socketcand,cda-comm-can/can-socketcand --lcov --output-path lcov-can-unit.info -- --show-output

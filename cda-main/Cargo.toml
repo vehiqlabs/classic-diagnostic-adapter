@@ -33,6 +33,7 @@ path = "src/lib.rs"
 [dependencies]
 cda-core = { workspace = true }
 cda-comm-can = { workspace = true }
+cda-comm-kline = { workspace = true }
 cda-comm-doip = { workspace = true }
 cda-transport-router = { workspace = true }
 cda-comm-uds = { workspace = true }
@@ -102,6 +103,7 @@ openssl-vendored = [
 ]
 mbedtls = ["cda-comm-doip/mbedtls"]
 can = ["cda-comm-can/can"]
+kline = ["cda-comm-kline/kline"]
 # SOVD operation to connect an ECU directly to an IP address (VIR/VAM bypass),
 # see `doip.direct_connect_enabled`. Intended for ECU development.
 doip-direct-connect = ["cda-sovd/doip-direct-connect"]
