@@ -551,6 +551,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cda-comm-kline"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cda-interfaces",
+ "schemars 1.2.2",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "cda-comm-uds"
 version = "0.1.0"
 dependencies = [
@@ -2809,6 +2823,7 @@ dependencies = [
  "backon",
  "cda-comm-can",
  "cda-comm-doip",
+ "cda-comm-kline",
  "cda-comm-uds",
  "cda-core",
  "cda-database",

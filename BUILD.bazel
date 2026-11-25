@@ -25,6 +25,12 @@ config_setting(
     visibility = ["//visibility:public"],
 )
 
+config_setting(
+    name = "kline_enabled",
+    define_values = {"kline": "true"},
+    visibility = ["//visibility:public"],
+)
+
 alias(
     name = "cda_mbedtls",
     actual = "//cda-main:opensovd_cda_lib",
