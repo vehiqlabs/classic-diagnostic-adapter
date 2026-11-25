@@ -21,6 +21,7 @@
 // an actionable error in `Configuration::validate_sanity` instead.
 pub use cda_comm_can::config::{CanAddressingMode, CanConfig, CanEcuMapping, TransportOverride};
 pub use cda_comm_doip::config::DoipConfig;
+pub use cda_comm_kline::config::KLineConfig;
 pub use cda_database::DatabaseConfig;
 use cda_interfaces::{
     BinaryEncoding, FunctionalDescriptionConfig, HashMap,
@@ -82,6 +83,8 @@ pub struct Configuration {
     /// When enabled, the adapter can communicate with ECUs over CAN bus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub can: Option<CanConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kline: Option<KLineConfig>,
     /// Diagnostic database loading and naming settings.
     pub database: DatabaseConfig,
     /// Logging, file output, and tracing backend settings.
@@ -318,6 +321,7 @@ impl Default for Configuration {
                 ..Default::default()
             },
             can: None,
+            kline: None,
             logging: cda_tracing::LoggingConfig::default(),
             com_params: ComParams::default(),
             flat_buf: FlatbBufConfig::default(),
@@ -374,11 +378,21 @@ impl Configuration {
             });
         }
 
-        if !self.doip.enabled && self.can.is_none() {
+        #[cfg(not(feature = "kline"))]
+        if self.kline.is_some() {
+            return Err(ConfigSanityError::InvalidValue {
+                field: "kline".to_owned(),
+                reason: "[kline] is configured, but this binary was built without K-Line support. \
+                         Rebuild with `--features kline` or remove the [kline] section."
+                    .to_owned(),
+            });
+        }
+
+        if !self.doip.enabled && self.can.is_none() && self.kline.is_none() {
             return Err(ConfigSanityError::InvalidValue {
                 field: "doip.enabled".to_owned(),
-                reason: "No transport configured: doip.enabled = false and no [can] section. \
-                         Enable DoIP or configure CAN."
+                reason: "No transport configured: doip.enabled = false and no [can] or [kline] \
+                         section. Enable DoIP or configure CAN or K-Line."
                     .to_owned(),
             });
         }
@@ -441,6 +455,7 @@ impl Configuration {
                 // ECU may get its CAN addressing from the MDD com-params,
                 // which the config layer cannot see.
                 TransportType::Can => {}
+                TransportType::KLine => {}
                 TransportType::DoIP => {
                     if !self.doip.enabled {
                         return Err(ConfigSanityError::InvalidValue {

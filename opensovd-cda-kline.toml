@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: 2026 Copyright (c) Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Example configuration for the K-Line transport (ISO 14230 / ISO 9141-2).
+# This enables K-Line communication while keeping DoIP disabled.
+# Requires a binary built with the `kline` cargo feature, e.g.
+#   CDA_CONFIG_FILE=opensovd-cda-kline.toml cargo run -p opensovd-cda --features kline
+
+flash_files_path = "./flash"
+
+[server]
+transport = "tcp"
+address = "0.0.0.0"
+port = 20002
+
+[database]
+dir = "./mdds"
+fallback_to_base_variant = true
+
+# DoIP is disabled. The block is still required (Configuration.doip is
+# non-Option), but CDA skips DoIP initialization when enabled = false.
+[doip]
+enabled = false
+tester_address = "127.0.0.1"
+tester_subnet = "255.255.0.0"
+gateway_port = 13400
+send_timeout_ms = 1000
+
+# K-Line configuration
+[kline]
+# Serial device the USB K-Line adapter is reached through.
+interface = "/dev/ttyUSB0"
+
+# Link initialization mode: "fast_init" (ISO 14230-2) or "five_baud_init"
+# (ISO 14230-2 / ISO 9141-2).
+init_mode = "fast_init"
+
+# Response timeout in milliseconds (default: 5000ms).
+response_timeout_ms = 2000
+
+# Timeout for the init handshake when probing an ECU (default: 500ms).
+probe_timeout_ms = 500
+
+# TesterPresent keep-alive interval in milliseconds. It must stay below P3max
+# so the link is not dropped; 0 disables it.
+keepalive_interval_ms = 2000
+
+# Optional overrides for the ISO 14230-2 timing parameters (milliseconds).
+# Values not set here come from the MDD com-params, then the standard defaults.
+# [kline.timing]
+# p2_max_ms = 50
+# p3_min_ms = 55
+# p4_min_ms = 5
+
+# K-Line address mappings. CDA resolves per-ECU addresses from the MDD
+# com-params; an [[kline.ecu_mappings]] entry OVERRIDES whatever the MDD
+# provides for that ECU.
+[[kline.ecu_mappings]]
+ecu_name = "MyKLineEcu"
+# Physical target address byte carried in the ISO 14230-2 header.
+physical_address = 0x10
+# Optional functional (broadcast) target address byte.
+# functional_address = 0x33
+# Optional link baud rate; defaults to 10400 baud.
+# baud_rate = 10400
+
+# K-Line ECUs need a protocol override so a K-Line diag layer is selected
+# instead of the DoIP-specific default protocol name. Use a protocol name from
+# the database naming convention that matches the ECU's K-Line diag layer.
+# [ecu.MyKLineEcu]
+# protocol = "UDS_KLine"
+
+# Optional: per-ECU transport selection overrides, mirroring [can]. A value of
+# "kline" pins the ECU to this transport. ECU names are matched
+# case-insensitively; supported spellings: "kline" / "KLine" / "KLINE",
+# "can" / "CAN" and "doip" / "DoIP" / "DOIP".
+#
+# [[kline.transport_overrides]]
+# ecu_name = "MyKLineEcu"
+# transport = "kline"
+
+[logging.otel]
+enabled = false

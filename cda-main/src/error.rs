@@ -138,6 +138,22 @@ impl From<cda_comm_can::error::CanGatewaySetupError> for AppError {
     }
 }
 
+#[cfg(feature = "kline")]
+impl From<cda_comm_kline::error::KLineGatewaySetupError> for AppError {
+    fn from(value: cda_comm_kline::error::KLineGatewaySetupError) -> Self {
+        use cda_comm_kline::error::KLineGatewaySetupError;
+        match value {
+            KLineGatewaySetupError::InterfaceOpenFailed(_, _) => {
+                Self::InitializationFailed(value.to_string())
+            }
+            KLineGatewaySetupError::InvalidConfiguration(_) => Self::ConfigurationError {
+                message: value.to_string(),
+                source: None,
+            },
+        }
+    }
+}
+
 impl From<TracingSetupError> for AppError {
     fn from(value: TracingSetupError) -> Self {
         match value {
