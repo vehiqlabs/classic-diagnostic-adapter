@@ -187,6 +187,22 @@ impl From<CommunicationOperationFailure> for AppError {
     }
 }
 
+#[cfg(feature = "kline")]
+impl From<cda_comm_kline::error::KLineGatewaySetupError> for AppError {
+    fn from(value: cda_comm_kline::error::KLineGatewaySetupError) -> Self {
+        use cda_comm_kline::error::KLineGatewaySetupError;
+        match value {
+            KLineGatewaySetupError::InterfaceOpenFailed(_, _) => {
+                Self::InitializationFailed(value.to_string())
+            }
+            KLineGatewaySetupError::InvalidConfiguration(_) => Self::ConfigurationError {
+                message: value.to_string(),
+                source: None,
+            },
+        }
+    }
+}
+
 // Representation printed when returned from main().
 impl fmt::Debug for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -206,6 +222,26 @@ impl fmt::Debug for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "kline")]
+    #[test]
+    fn kline_setup_errors_map_to_initialization_and_configuration_errors() {
+        use cda_comm_kline::error::KLineGatewaySetupError;
+
+        assert!(matches!(
+            AppError::from(KLineGatewaySetupError::InterfaceOpenFailed(
+                "COM3".to_owned(),
+                "busy".to_owned()
+            )),
+            AppError::InitializationFailed(_)
+        ));
+        assert!(matches!(
+            AppError::from(KLineGatewaySetupError::InvalidConfiguration(
+                "empty".to_owned()
+            )),
+            AppError::ConfigurationError { source: None, .. }
+        ));
+    }
 
     #[test]
     fn should_write_source_errors_in_debug_format() {

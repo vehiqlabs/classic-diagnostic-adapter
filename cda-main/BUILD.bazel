@@ -48,6 +48,9 @@ workspace_rust_library(
     ] + select({
         "//:can_enabled": ["can"],
         "//conditions:default": [],
+    }) + select({
+        "//:kline_enabled": ["kline"],
+        "//conditions:default": [],
     }),
     crate_name = "opensovd_cda_lib",
     crate_root = "src/lib.rs",
@@ -63,6 +66,7 @@ workspace_rust_library(
     deps = [
         "//cda-comm-can:cda_comm_can",
         "//cda-comm-doip:cda_comm_doip",
+        "//cda-comm-kline:cda_comm_kline",
         "//cda-comm-uds:cda_comm_uds",
         "//cda-core:cda_core",
         "//cda-database:cda_database",

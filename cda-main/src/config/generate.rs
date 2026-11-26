@@ -133,6 +133,15 @@ value = 2015
         ..Default::default()
     });
 
+    let mut kline: cda_comm_kline::config::KLineConfig =
+        toml::from_str(r#"interface = "/dev/ttyUSB0""#).expect("valid partial K-Line TOML");
+    kline.timing = cda_comm_kline::config::KLineTimingConfig {
+        p2_max_ms: Some(50),
+        p3_min_ms: Some(55),
+        p4_min_ms: Some(5),
+    };
+    config.kline = Some(kline);
+
     // Set the global `com_params.can.*.value` to `Some(...)` so the
     // generated reference config emits those leaves (otherwise the
     // `reference_config_covers_all_schema_fields` test would flag
@@ -731,6 +740,28 @@ mod tests {
         config
             .validate_sanity()
             .expect("CAN example config should pass sanity validation");
+    }
+
+    #[cfg(feature = "kline")]
+    #[test]
+    fn kline_example_config_parses_as_valid_config() {
+        use figment::{
+            Figment,
+            providers::{Format, Serialized, Toml},
+        };
+
+        let example_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("opensovd-cda-kline.toml");
+        let config: crate::config::configfile::Configuration =
+            Figment::from(Serialized::defaults(crate::config::default_config()))
+                .merge(Toml::file(&example_path))
+                .extract()
+                .expect("opensovd-cda-kline.toml should be parseable as a valid Configuration");
+        assert!(config.kline.is_some());
+        config
+            .validate_sanity()
+            .expect("K-Line example config should pass sanity validation");
     }
 
     /// Collect all leaf property paths from the JSON Schema.

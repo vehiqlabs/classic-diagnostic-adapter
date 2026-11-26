@@ -20,6 +20,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use cda_comm_can::{CanDiagGateway, config::CanConfig};
 use cda_comm_doip::{DoipDiagGateway, config::DoipConfig};
+use cda_comm_kline::{KLineDiagGateway, config::KLineConfig};
 use cda_comm_uds::{UdsManager, state_coordinator::EcuStateCoordinator};
 use cda_core::EcuManager;
 use cda_database::FileManager;
@@ -48,13 +49,14 @@ pub type DatabaseMap<S> = HashMap<String, RwLock<EcuManager<S>>>;
 pub type FileManagerMap = HashMap<String, FileManager>;
 
 pub type UdsManagerType<S> = UdsManager<
-    DiagnosticTransportRouter<DoipDiagGateway<EcuManager<S>>, CanDiagGateway>,
+    DiagnosticTransportRouter<DoipDiagGateway<EcuManager<S>>, CanDiagGateway, KLineDiagGateway>,
     EcuManager<S>,
 >;
 
 pub struct VehicleData<S: SecurityPlugin> {
-    pub diagnostic_gateway:
-        ComponentSlot<DiagnosticTransportRouter<DoipDiagGateway<EcuManager<S>>, CanDiagGateway>>,
+    pub diagnostic_gateway: ComponentSlot<
+        DiagnosticTransportRouter<DoipDiagGateway<EcuManager<S>>, CanDiagGateway, KLineDiagGateway>,
+    >,
     pub locks: Arc<Locks>,
     pub(crate) prepared: PreparedVehicleComponents<S>,
     pub databases: Arc<DatabaseMap<S>>,
@@ -64,14 +66,15 @@ pub struct VehicleData<S: SecurityPlugin> {
 pub struct VehicleComponents<S: SecurityPlugin> {
     pub uds_manager: UdsManagerType<S>,
     pub diagnostic_gateway:
-        DiagnosticTransportRouter<DoipDiagGateway<EcuManager<S>>, CanDiagGateway>,
+        DiagnosticTransportRouter<DoipDiagGateway<EcuManager<S>>, CanDiagGateway, KLineDiagGateway>,
     pub file_managers: FileManagerMap,
 }
 
 pub(crate) struct PreparedVehicleComponents<S: SecurityPlugin> {
     databases: Arc<DatabaseMap<S>>,
     file_managers: FileManagerMap,
-    diagnostic_gateway: DiagnosticTransportRouter<DoipDiagGateway<EcuManager<S>>, CanDiagGateway>,
+    diagnostic_gateway:
+        DiagnosticTransportRouter<DoipDiagGateway<EcuManager<S>>, CanDiagGateway, KLineDiagGateway>,
     variant_detection_rx: VariantDetectionReceiver,
     state_coordinator: EcuStateCoordinator,
 }
@@ -83,6 +86,8 @@ pub struct TransportConfigs<'a> {
     pub doip: &'a DoipConfig,
     /// `None` disables the CAN transport (no `[can]` section).
     pub can: Option<&'a CanConfig>,
+    /// `None` disables the K-Line transport (no `[kline]` section).
+    pub kline: Option<&'a KLineConfig>,
 }
 
 /// Loads vehicle data including MDD databases and vehicle components.
@@ -185,7 +190,11 @@ pub async fn load_vehicle_data<S: SecurityPlugin>(
               semantics explicit"
 )]
 pub fn create_uds_manager<S: SecurityPlugin>(
-    gateway: DiagnosticTransportRouter<DoipDiagGateway<EcuManager<S>>, CanDiagGateway>,
+    gateway: DiagnosticTransportRouter<
+        DoipDiagGateway<EcuManager<S>>,
+        CanDiagGateway,
+        KLineDiagGateway,
+    >,
     databases: Arc<HashMap<String, RwLock<EcuManager<S>>>>,
     variant_detection_receiver: VariantDetectionReceiver,
     state_coordinator: EcuStateCoordinator,
@@ -270,6 +279,7 @@ async fn prepare_vehicle_components<S: SecurityPlugin>(
         TransportConfigs {
             doip: &config.doip,
             can: config.can.as_ref(),
+            kline: config.kline.as_ref(),
         },
         variant_detection_tx,
         connectivity_handler,
@@ -352,10 +362,14 @@ pub async fn create_diagnostic_gateway<S: SecurityPlugin>(
     connectivity_handler: Arc<dyn EcuConnectivityHandler>,
     doip_health_provider: Option<&Arc<dyn HealthProvider>>,
     topology_state: Arc<TopologyState>,
-) -> Result<DiagnosticTransportRouter<DoipDiagGateway<EcuManager<S>>, CanDiagGateway>, AppError> {
+) -> Result<
+    DiagnosticTransportRouter<DoipDiagGateway<EcuManager<S>>, CanDiagGateway, KLineDiagGateway>,
+    AppError,
+> {
     let TransportConfigs {
         doip: doip_config,
         can: can_config,
+        kline: kline_config,
     } = transports;
     // Transport owners remain stable while routing bindings are updated in place.
     let transport_overrides: HashMap<String, TransportType> = can_config
@@ -366,11 +380,13 @@ pub async fn create_diagnostic_gateway<S: SecurityPlugin>(
                 .collect()
         })
         .unwrap_or_default();
+    let transport_overrides = with_kline_transport_overrides(transport_overrides, kline_config);
 
-    let mut gateway =
-        DiagnosticTransportRouter::<DoipDiagGateway<EcuManager<S>>, CanDiagGateway>::new(
-            transport_overrides,
-        );
+    let mut gateway = DiagnosticTransportRouter::<
+        DoipDiagGateway<EcuManager<S>>,
+        CanDiagGateway,
+        KLineDiagGateway,
+    >::new(transport_overrides);
 
     // Fail clearly when CAN is configured on a build without CAN support.
     // (validate_sanity rejects this too; kept as defense in depth for direct
@@ -384,6 +400,15 @@ pub async fn create_diagnostic_gateway<S: SecurityPlugin>(
             source: None,
         });
     }
+
+    gateway = attach_kline_gateway(
+        gateway,
+        &databases,
+        kline_config,
+        variant_detection.clone(),
+        Arc::clone(&connectivity_handler),
+    )
+    .await?;
 
     if let Some(doip) = init_doip_gateway(
         &databases,
@@ -477,5 +502,205 @@ async fn init_can_gateway<S: SecurityPlugin>(
         }
         // Fatal; main reports the error on exit.
         Err(e) => Err(e.into()),
+    }
+}
+
+fn with_kline_transport_overrides(
+    mut transport_overrides: HashMap<String, TransportType>,
+    kline_config: Option<&KLineConfig>,
+) -> HashMap<String, TransportType> {
+    if let Some(kline) = kline_config {
+        transport_overrides.extend(
+            kline
+                .transport_overrides
+                .iter()
+                .map(|o| (o.ecu_name.to_lowercase(), o.transport)),
+        );
+    }
+    transport_overrides
+}
+
+#[cfg(feature = "kline")]
+async fn attach_kline_gateway<S: SecurityPlugin>(
+    gateway: DiagnosticTransportRouter<
+        DoipDiagGateway<EcuManager<S>>,
+        CanDiagGateway,
+        KLineDiagGateway,
+    >,
+    databases: &Arc<DatabaseMap<S>>,
+    kline_config: Option<&KLineConfig>,
+    variant_detection: VariantDetectionSender,
+    connectivity_handler: Arc<dyn EcuConnectivityHandler>,
+) -> Result<
+    DiagnosticTransportRouter<DoipDiagGateway<EcuManager<S>>, CanDiagGateway, KLineDiagGateway>,
+    AppError,
+> {
+    match kline_config {
+        Some(kline_cfg) => Ok(gateway.with_kline(
+            init_kline_gateway(
+                databases,
+                kline_cfg,
+                variant_detection,
+                connectivity_handler,
+            )
+            .await?,
+        )),
+        None => Ok(gateway),
+    }
+}
+
+#[cfg(not(feature = "kline"))]
+#[expect(
+    clippy::unused_async,
+    reason = "Same signature as the kline build, which awaits the gateway setup"
+)]
+async fn attach_kline_gateway<S: SecurityPlugin>(
+    gateway: DiagnosticTransportRouter<
+        DoipDiagGateway<EcuManager<S>>,
+        CanDiagGateway,
+        KLineDiagGateway,
+    >,
+    _databases: &Arc<DatabaseMap<S>>,
+    kline_config: Option<&KLineConfig>,
+    _variant_detection: VariantDetectionSender,
+    _connectivity_handler: Arc<dyn EcuConnectivityHandler>,
+) -> Result<
+    DiagnosticTransportRouter<DoipDiagGateway<EcuManager<S>>, CanDiagGateway, KLineDiagGateway>,
+    AppError,
+> {
+    match kline_config {
+        Some(_) => Err(AppError::ConfigurationError {
+            message: "[kline] is configured, but this binary was built without K-Line support. \
+                      Rebuild with `--features kline` or remove the [kline] section."
+                .to_owned(),
+            source: None,
+        }),
+        None => Ok(gateway),
+    }
+}
+
+#[cfg(feature = "kline")]
+async fn init_kline_gateway<S: SecurityPlugin>(
+    databases: &Arc<DatabaseMap<S>>,
+    kline_cfg: &KLineConfig,
+    variant_detection: VariantDetectionSender,
+    connectivity_handler: Arc<dyn EcuConnectivityHandler>,
+) -> Result<KLineDiagGateway, AppError> {
+    let topology = cda_comm_kline::derive_kline_topology(kline_cfg, databases).await?;
+    let gateway =
+        KLineDiagGateway::build(kline_cfg, topology, variant_detection, connectivity_handler)?;
+    tracing::info!(interface = %kline_cfg.interface, "K-Line gateway initialized");
+    Ok(gateway)
+}
+
+#[cfg(test)]
+mod tests {
+    use cda_interfaces::{
+        GatewayConnectReport, VariantDetectionSender, topology::DiscoveryStrategy,
+    };
+    use cda_plugin_security::DefaultSecurityPluginData;
+
+    use super::*;
+
+    struct NoConnectivity;
+
+    #[async_trait::async_trait]
+    impl EcuConnectivityHandler for NoConnectivity {
+        async fn on_gateway_connected(&self, _ecu_names: &[String]) -> GatewayConnectReport {
+            GatewayConnectReport::default()
+        }
+
+        async fn on_gateway_disconnected(&self, _ecu_names: &[String]) {}
+
+        async fn on_ecu_replied(&self, _ecu_name: &str) {}
+    }
+
+    fn kline_config(toml_text: &str) -> KLineConfig {
+        toml::from_str(toml_text).expect("valid K-Line config")
+    }
+
+    async fn gateway_with(
+        kline: Option<&KLineConfig>,
+    ) -> Result<
+        DiagnosticTransportRouter<
+            DoipDiagGateway<EcuManager<DefaultSecurityPluginData>>,
+            CanDiagGateway,
+            KLineDiagGateway,
+        >,
+        AppError,
+    > {
+        let (sender, _receiver) = mpsc::channel(1);
+        create_diagnostic_gateway::<DefaultSecurityPluginData>(
+            Arc::new(DatabaseMap::default()),
+            TransportConfigs {
+                doip: &DoipConfig {
+                    enabled: false,
+                    ..DoipConfig::default()
+                },
+                can: None,
+                kline,
+            },
+            VariantDetectionSender::new(sender),
+            Arc::new(NoConnectivity),
+            None,
+            TopologyState::new(DiscoveryStrategy::Vir),
+        )
+        .await
+    }
+
+    #[cfg(feature = "kline")]
+    #[tokio::test]
+    async fn a_kline_section_joins_the_kline_gateway_with_its_pins() {
+        use cda_interfaces::NetworkTopology as _;
+
+        let gateway = gateway_with(Some(&kline_config(
+            r#"
+interface = "COM3"
+
+[[ecu_mappings]]
+ecu_name = "EngineKwp"
+physical_address = 0x10
+
+[[transport_overrides]]
+ecu_name = "EngineKwp"
+transport = "kline"
+"#,
+        )))
+        .await
+        .expect("gateway with a K-Line transport");
+
+        assert_eq!(
+            gateway.get_ecu_network_address("EngineKwp").await,
+            Some("kline://COM3:16".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_kline_section_no_kline_gateway_is_set_up() {
+        use cda_interfaces::NetworkTopology as _;
+
+        let gateway = gateway_with(None)
+            .await
+            .expect("gateway without a K-Line transport");
+
+        assert_eq!(gateway.get_ecu_network_address("EngineKwp").await, None);
+    }
+
+    #[cfg(feature = "kline")]
+    #[tokio::test]
+    async fn an_invalid_kline_section_fails_the_gateway_setup() {
+        assert!(matches!(
+            gateway_with(Some(&kline_config(r#"interface = " ""#))).await,
+            Err(AppError::ConfigurationError { .. })
+        ));
+    }
+
+    #[cfg(not(feature = "kline"))]
+    #[tokio::test]
+    async fn a_kline_section_is_rejected_without_the_kline_feature() {
+        assert!(matches!(
+            gateway_with(Some(&kline_config(r#"interface = "COM3""#))).await,
+            Err(AppError::ConfigurationError { .. })
+        ));
     }
 }

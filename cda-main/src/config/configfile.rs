@@ -21,6 +21,7 @@
 // an actionable error in `Configuration::validate_sanity` instead.
 pub use cda_comm_can::config::{CanAddressingMode, CanConfig, CanEcuMapping, TransportOverride};
 pub use cda_comm_doip::config::DoipConfig;
+pub use cda_comm_kline::config::KLineConfig;
 pub use cda_database::DatabaseConfig;
 use cda_interfaces::{
     BinaryEncoding, FunctionalDescriptionConfig, HashMap,
@@ -82,6 +83,9 @@ pub struct Configuration {
     /// When enabled, the adapter can communicate with ECUs over CAN bus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub can: Option<CanConfig>,
+    /// Optional K-Line serial transport configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kline: Option<KLineConfig>,
     /// Diagnostic database loading and naming settings.
     pub database: DatabaseConfig,
     /// Logging, file output, and tracing backend settings.
@@ -318,6 +322,7 @@ impl Default for Configuration {
                 ..Default::default()
             },
             can: None,
+            kline: None,
             logging: cda_tracing::LoggingConfig::default(),
             com_params: ComParams::default(),
             flat_buf: FlatbBufConfig::default(),
@@ -374,15 +379,29 @@ impl Configuration {
             });
         }
 
-        if !self.doip.enabled && self.can.is_none() {
+        #[cfg(not(feature = "kline"))]
+        if self.kline.is_some() {
+            return Err(ConfigSanityError::InvalidValue {
+                field: "kline".to_owned(),
+                reason: "[kline] is configured, but this binary was built without K-Line support. \
+                         Rebuild with `--features kline` or remove the [kline] section."
+                    .to_owned(),
+            });
+        }
+
+        if !self.doip.enabled && !self.has_bus_transport() {
             return Err(ConfigSanityError::InvalidValue {
                 field: "doip.enabled".to_owned(),
-                reason: "No transport configured: doip.enabled = false and no [can] section. \
-                         Enable DoIP or configure CAN."
+                reason: "No transport configured: doip.enabled = false and no [can] or [kline] \
+                         section. Enable DoIP or configure CAN or K-Line."
                     .to_owned(),
             });
         }
         Ok(())
+    }
+
+    fn has_bus_transport(&self) -> bool {
+        self.can.is_some() || self.kline.is_some()
     }
 
     /// CAN ECU mappings must be unambiguous: a duplicate ECU name silently
@@ -432,38 +451,50 @@ impl Configuration {
     /// Transport pins must be satisfiable: a pin to a transport that cannot
     /// serve the ECU would only surface as `EcuOffline` at runtime.
     fn validate_transport_overrides(&self) -> Result<(), ConfigSanityError> {
-        let Some(ref can) = self.can else {
-            return Ok(());
-        };
-        for transport_override in &can.transport_overrides {
-            match transport_override.transport {
-                // A pin to CAN is validated at gateway setup, not here: the
-                // ECU may get its CAN addressing from the MDD com-params,
-                // which the config layer cannot see.
-                TransportType::Can => {}
-                TransportType::KLine => {
-                    return Err(ConfigSanityError::InvalidValue {
-                        field: "can.transport_overrides".to_owned(),
-                        reason: format!(
-                            "Pins ECU '{}' to K-Line, but no K-Line transport is configured",
-                            transport_override.ecu_name
-                        ),
-                    });
-                }
-                TransportType::DoIP => {
-                    if !self.doip.enabled {
-                        return Err(ConfigSanityError::InvalidValue {
-                            field: "can.transport_overrides".to_owned(),
-                            reason: format!(
-                                "Pins ECU '{}' to DoIP, but doip.enabled = false",
-                                transport_override.ecu_name
-                            ),
-                        });
-                    }
-                }
-            }
+        let mut pinned = HashMap::<String, TransportType>::default();
+        for (field, ecu_name, transport) in self.transport_pins() {
+            self.validate_pin_target(field, ecu_name, transport)?;
+            validate_single_pin(&mut pinned, field, ecu_name, transport)?;
         }
         Ok(())
+    }
+
+    fn transport_pins(&self) -> impl Iterator<Item = (&'static str, &String, TransportType)> {
+        let can_pins = self.can.iter().flat_map(|can| {
+            can.transport_overrides
+                .iter()
+                .map(|pin| ("can.transport_overrides", &pin.ecu_name, pin.transport))
+        });
+        let kline_pins = self.kline.iter().flat_map(|kline| {
+            kline
+                .transport_overrides
+                .iter()
+                .map(|pin| ("kline.transport_overrides", &pin.ecu_name, pin.transport))
+        });
+        can_pins.chain(kline_pins)
+    }
+
+    fn validate_pin_target(
+        &self,
+        field: &str,
+        ecu_name: &str,
+        transport: TransportType,
+    ) -> Result<(), ConfigSanityError> {
+        let unavailable = match transport {
+            // A pin to CAN is validated at gateway setup, not here: the
+            // ECU may get its CAN addressing from the MDD com-params,
+            // which the config layer cannot see.
+            TransportType::Can => self.can.is_none().then_some("no [can] section"),
+            TransportType::KLine => self.kline.is_none().then_some("no [kline] section"),
+            TransportType::DoIP => (!self.doip.enabled).then_some("doip.enabled = false"),
+        };
+        match unavailable {
+            Some(reason) => Err(ConfigSanityError::InvalidValue {
+                field: field.to_owned(),
+                reason: format!("Pins ECU '{ecu_name}' to {transport:?}, but {reason}"),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// An empty default functional class would make every flash request without
@@ -518,6 +549,24 @@ impl ConfigSanity for Configuration {
         self.validate_topology();
         // Add more checks for Configuration fields here if needed
         Ok(())
+    }
+}
+
+fn validate_single_pin(
+    pinned: &mut HashMap<String, TransportType>,
+    field: &str,
+    ecu_name: &str,
+    transport: TransportType,
+) -> Result<(), ConfigSanityError> {
+    match pinned.insert(ecu_name.to_lowercase(), transport) {
+        Some(previous) if previous != transport => Err(ConfigSanityError::InvalidValue {
+            field: field.to_owned(),
+            reason: format!(
+                "Pins ECU '{ecu_name}' to {transport:?}, but another override pins it to \
+                 {previous:?}"
+            ),
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -828,6 +877,132 @@ address = "127.0.0.1"
             Err(ConfigSanityError::InvalidValue { field, .. })
                 if field == "can.transport_overrides"
         ));
+    }
+
+    fn kline_config(toml_text: &str) -> Configuration {
+        Figment::from(Serialized::defaults(Configuration::default()))
+            .merge(Toml::string(toml_text))
+            .extract()
+            .expect("valid config")
+    }
+
+    #[test]
+    fn kline_pins_are_checked_against_the_configured_transports() {
+        let valid = kline_config(
+            r#"
+[kline]
+interface = "COM3"
+
+[[kline.transport_overrides]]
+ecu_name = "ECU_K"
+transport = "kline"
+"#,
+        );
+        assert!(valid.validate_transport_overrides().is_ok());
+
+        let pinned_to_missing_can = kline_config(
+            r#"
+[kline]
+interface = "/dev/ttyUSB0"
+
+[[kline.transport_overrides]]
+ecu_name = "ECU_C"
+transport = "can"
+"#,
+        );
+        assert!(matches!(
+            pinned_to_missing_can.validate_transport_overrides(),
+            Err(ConfigSanityError::InvalidValue { field, .. })
+                if field == "kline.transport_overrides"
+        ));
+    }
+
+    #[test]
+    fn a_configuration_without_any_transport_is_rejected() {
+        let config = kline_config(
+            r"
+[doip]
+enabled = false
+",
+        );
+        assert!(matches!(
+            config.validate_sanity(),
+            Err(ConfigSanityError::InvalidValue { field, reason })
+                if field == "doip.enabled" && reason.contains("[kline]")
+        ));
+    }
+
+    #[test]
+    fn a_kline_section_pin_to_a_disabled_doip_is_rejected() {
+        let config = kline_config(
+            r#"
+[doip]
+enabled = false
+
+[kline]
+interface = "COM3"
+
+[[kline.transport_overrides]]
+ecu_name = "ECU_D"
+transport = "doip"
+"#,
+        );
+        assert!(matches!(
+            config.validate_transport_overrides(),
+            Err(ConfigSanityError::InvalidValue { field, reason })
+                if field == "kline.transport_overrides" && reason.contains("doip.enabled = false")
+        ));
+    }
+
+    #[test]
+    fn conflicting_pins_across_sections_are_rejected() {
+        let config = kline_config(
+            r#"
+[can]
+interface = "vcan0"
+
+[[can.transport_overrides]]
+ecu_name = "ECU_X"
+transport = "can"
+
+[kline]
+interface = "/dev/cu.usbserial-0001"
+
+[[kline.transport_overrides]]
+ecu_name = "ecu_x"
+transport = "kline"
+"#,
+        );
+        let err = config
+            .validate_transport_overrides()
+            .expect_err("one ECU pinned to two transports");
+        assert!(err.to_string().contains("another override"), "got: {err}");
+    }
+
+    #[test]
+    fn kline_section_parses_and_sanity_depends_on_feature() {
+        let config = kline_config(
+            r#"
+[kline]
+interface = "COM3"
+"#,
+        );
+        assert_eq!(
+            config.kline.as_ref().map(|kline| kline.interface.as_str()),
+            Some("COM3")
+        );
+
+        #[cfg(feature = "kline")]
+        config
+            .validate_sanity()
+            .expect("kline section should pass sanity with the kline feature");
+        #[cfg(not(feature = "kline"))]
+        {
+            let err = config
+                .validate_sanity()
+                .expect_err("kline section should fail sanity without the kline feature");
+            assert!(err.to_string().contains("--features kline"), "got: {err}");
+        }
     }
 
     #[test]

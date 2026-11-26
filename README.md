@@ -85,6 +85,22 @@ Use `--protocol-name` to select the DoIP protocol variant used for com-param loo
 cargo run --release -- --databases-dir ./databases --tester-address <YOUR_IP> --protocol-name UDS_Ethernet_DoIP
 ```
 
+### transports
+
+Besides DoIP, the CDA can reach ECUs over CAN/ISO-TP (the `can` feature, a
+`[can]` section) and over K-Line (the `kline` feature, a `[kline]` section).
+
+K-Line (ISO 14230 / ISO 9141-2, KWP2000) is a first skeleton
+([eclipse-opensovd/classic-diagnostic-adapter#767](https://github.com/eclipse-opensovd/classic-diagnostic-adapter/issues/767)):
+the `cda-comm-kline` crate, the transport-router wiring and the `[kline]` config
+are in place, while the serial I/O and the data-link, init and timing logic are
+follow-up work. The adapter is reached through a serial port on Linux, macOS or
+Windows; `kline.interface` is required and takes the port name of the host, e.g.
+`/dev/ttyUSB0` (Linux), `/dev/cu.usbserial-XXXX` (macOS) or `COM3` (Windows).
+Build it with `--features kline` and see `opensovd-cda-kline.toml` for an example
+configuration. The architecture entry is under
+`docs/03_architecture/03_communication/`.
+
 ## ODX to SOVD path mapping
 
 The CDA translates ODX diagnostic descriptions into SOVD REST resources. The
