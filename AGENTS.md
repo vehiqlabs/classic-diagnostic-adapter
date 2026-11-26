@@ -29,7 +29,7 @@ Rust Cargo workspace (see the `cda-rust-development` skill).
 | `cda-database` | MDD database loading (protobuf / flatbuffers) |
 | `cda-comm-uds` | UDS layer (sessions, security access, tester present, ...) |
 | `cda-transport-router` | Routes UDS traffic to the right transport |
-| `cda-comm-doip`, `cda-comm-can` | DoIP and CAN/ISO-TP transports |
+| `cda-comm-doip`, `cda-comm-can`, `cda-comm-kline` | DoIP, CAN/ISO-TP and K-Line transports |
 | `cda-interfaces` | Shared traits and types between crates |
 | `cda-tracing` | Logging, DLT, OpenTelemetry setup |
 | `cda-plugin-*` | Plugins (security, lock priority, runtime update, communication management) |

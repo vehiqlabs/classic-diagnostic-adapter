@@ -16,6 +16,7 @@ build --stamp
 build --workspace_status_command=./bazel/workspace_status.py
 
 build:can --define=can=true
+build:kline --define=kline=true
 # workaround for Xcode build tools using absolute paths on macOS
 build:macos-clt --repo_env=DEVELOPER_DIR=/Library/Developer/CommandLineTools
 build:macos-clt --action_env=DEVELOPER_DIR=/Library/Developer/CommandLineTools
